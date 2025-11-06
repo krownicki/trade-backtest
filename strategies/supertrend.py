@@ -1,6 +1,6 @@
 import backtrader as bt
 
-from utils import SuperTrend
+from indicators import SuperTrend
 
 
 class SuperTrendStrategy(bt.Strategy):
