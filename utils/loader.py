@@ -5,17 +5,19 @@ Usage: python import_csv_postgres.py path/to/file.csv SYMBOL_ID [--table TABLE] 
 Defaults DB connection values match the docker run in the task.
 """
 import argparse
-from sqlalchemy import create_engine, text
+import logging
+
+from sqlalchemy import text
 import pandas as pd
 import sys
 
-DEFAULT_DB = {
-    "user": "app_user",
-    "password": "pwd1234",
-    "host": "localhost",
-    "port": 5432,
-    "dbname": "ctrader"
-}
+from utils.db import trendbars_table, get_engine
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS {table} (
@@ -36,9 +38,9 @@ CREATE TABLE IF NOT EXISTS {table} (
 def build_db_url(user, password, host, port, dbname):
     return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
 
-def prepare_df(df, args):
+def prepare_df(df, symbol_id):
     if "timestamp" not in df.columns:
-        print("Plik CSV musi zawierać kolumnę 'timestamp'.", file=sys.stderr)
+        logging.error("Plik CSV musi zawierać kolumnę 'timestamp'.", file=sys.stderr)
         sys.exit(1)
     # Optionally compute open/close/high if deltas present and open/close/high missing
     if {"delta_open", "delta_close", "delta_high", "low"}.issubset(df.columns):
@@ -49,7 +51,7 @@ def prepare_df(df, args):
         if "high" not in df.columns:
             df["high"] = df["low"] + df["delta_high"]
     df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
-    df["symbol_id"] = int(args.symbol_id)
+    df["symbol_id"] = int(symbol_id)
 
     df = df.drop_duplicates(subset=["period", "symbol_id", "timestamp"], keep="first")
     # Keep only relevant columns (columns present in CSV + computed open/close/high + symbol_id)
@@ -65,7 +67,7 @@ def save_chunk_in_db(df_chunk, engine, table):
     # pobierz timestamp ale odflitruj >= min_timestamp i <= max_timestamp
     # sprawdź których nie ma w bazie danych i tylko te dodaj
     if df_chunk.empty:
-        print("Batch pusty, pomijam.")
+        logging.info("Batch pusty, pomijam.")
         return 0, 0
 
         # assume symbol_id same for whole chunk
@@ -106,16 +108,16 @@ def save_chunk_in_db(df_chunk, engine, table):
     skipped = before - after
 
     if after == 0:
-        print(f"Batch: wszystkie {before} wierszy istnieją w DB (pominięto {skipped}).")
+        logging.warn(f"Batch: wszystkie {before} wierszy istnieją w DB (pominięto {skipped}).")
         return 0, skipped
 
     # Insert new rows
     try:
         df_new.to_sql(table, engine, if_exists="append", index=False, method="multi")
-        print(f"Batch: wstawiono {after} nowych, pominięto {skipped}.")
+        logging.info(f"Batch: wstawiono {after} nowych do tabeli {table}, pominięto {skipped}.")
         return after, skipped
     except Exception as e:
-        print("Błąd przy wstawianiu batcha do DB:", e, file=sys.stderr)
+        logging.error("Błąd przy wstawianiu batcha do DB:", e, file=sys.stderr)
         # W razie błędu nie zakładamy wstawienia żadnego wiersza (można rozszerzyć o retry/log)
         return 0, skipped
     pass
@@ -124,60 +126,30 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("csv", help="ścieżka do pliku CSV")
     parser.add_argument("symbol_id", type=int, help="symbolId (int) do przypisania do wierszy")
-    parser.add_argument("--table", default="market_data", help="nazwa tabeli w DB (domyślnie market_data)")
-    parser.add_argument("--dburl", default=None, help="pełny DB URL - jeśli podasz, nadpisze domyślne parametry")
+    parser.add_argument("--table", default=trendbars_table, help="nazwa tabeli w DB (domyślnie market_data)")
     parser.add_argument("--batch-size", type=int, default=1000, help="rozmiar batcha (domyślnie 1000)")
     args = parser.parse_args()
 
-    # DB url
-    if args.dburl:
-        db_url = args.dburl
-    else:
-        db_url = build_db_url(DEFAULT_DB["user"], DEFAULT_DB["password"],
-                              DEFAULT_DB["host"], DEFAULT_DB["port"], DEFAULT_DB["dbname"])
-
     # Read CSV
-    total_rows_loaded = 0
     table = args.table
-    engine = create_engine(db_url, future=True)
+    engine = get_engine()
+    upload_csv_to_db(engine, args.csv, args.symbol_id, table, args.batch_size)
+
+def upload_csv_to_db(engine, filepath, symbol_id, table, batch_size=1000):
+    total_rows_loaded = 0
     with engine.begin() as conn:
         conn.execute(text(CREATE_TABLE_SQL.format(table=table)))
     try:
-        for chunk in pd.read_csv(args.csv, parse_dates=["timestamp"], chunksize=args.batch_size):
-            df = prepare_df(chunk, args)
+        for chunk in pd.read_csv(filepath, parse_dates=["timestamp"], chunksize=batch_size):
+            df = prepare_df(chunk, symbol_id)
             save_chunk_in_db(df, engine, table)
             total_rows_loaded += len(df)
     except Exception as e:
-        print("Błąd wczytywania CSV:", e, file=sys.stderr)
+        logging.error("Błąd wczytywania CSV:", e, file=sys.stderr)
         sys.exit(1)
 
-    print(f"Załadowano {total_rows_loaded} wierszy")
+    logging.info(f"Załadowano {total_rows_loaded} wierszy do tabeli {table}.")
 
-        # q = text(f"SELECT timestamp FROM {table} WHERE symbol_id = :symbol_id AND period = :period")
-        # res = conn.execute(q, {"symbol_id": args.symbol_id, "period": args.period})
-        # existing_ts = {row[0] for row in res.fetchall()}
-
-    # Filter out rows with timestamps already in DB
-    # before = len(df_to_insert)
-    # if existing_ts:
-    #     df_new = df_to_insert[~df_to_insert["timestamp"].isin(existing_ts)].copy()
-    # else:
-    #     df_new = df_to_insert.copy()
-    # after = len(df_new)
-    # skipped = before - after
-    #
-    # if after == 0:
-    #     print(f"Brak nowych rekordów do dodania (wszystkie {before} rekordów już są w DB).")
-    #     return
-    #
-    # # Insert new rows
-    # try:
-    #     # to_sql używa SQLAlchemy engine
-    #     df_new.to_sql(table, engine, if_exists="append", index=False, method="multi")
-    #     print(f"Wstawiono {after} nowych rekordów do tabeli '{table}'. Pominięto {skipped}.")
-    # except Exception as e:
-    #     print("Błąd przy wstawianiu do DB:", e, file=sys.stderr)
-    #     sys.exit(1)
 
 if __name__ == "__main__":
     main()
